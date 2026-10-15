@@ -541,6 +541,13 @@ without throttling. For profiles serving clients on TSPU-filtered paths, set
 `"carrier_mode": "https-lanes"` (or `"https"` as a conservative fallback) instead
 of switching between WebSocket modes.
 
+To allow Telegram voice/video call TCP reflectors (`phoneConnection` TCP endpoints)
+through a profile using `https-lanes`, `websocket-lanes`, or `https-stream`, set
+`"calls_tcp": true`. When `call_allowlist` and `call_ports` are omitted, the relay
+populates official Telegram ASN IPv4/IPv6 CIDR prefixes and ports `[443, 5222]`,
+while unconditionally blocking loopback, RFC 1918, RFC 4193, link-local, multicast,
+and unspecified addresses before checking the allowlist.
+
 Run one official MTProxy process and listener per profile when profiles need
 separate quotas or routing. Extend `firewall.nft` to include every added backend
 port. A single MTProxy may receive repeated `-S` arguments only when all profiles
