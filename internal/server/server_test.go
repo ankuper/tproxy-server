@@ -789,6 +789,8 @@ func TestCallsTCPHeaderAndDualSessionSidecar(t *testing.T) {
 	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
 		value.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
 		value.Profiles[0].CallsTCP = true
+		value.Profiles[0].CallPadBuckets = config.DefaultCallPadBuckets()
+		value.Profiles[0].CallFlushJitterMs = config.DefaultCallFlushJitterMs
 	})
 	defer application.Shutdown()
 	hosted := httptest.NewServer(application.Handler())
@@ -818,6 +820,12 @@ func TestCallsTCPHeaderAndDualSessionSidecar(t *testing.T) {
 		}
 		if created.Header.Get("X-Call-TCP") != "1" {
 			t.Fatalf("expected X-Call-TCP: 1 header, got %q", created.Header.Get("X-Call-TCP"))
+		}
+		if created.Header.Get("X-Call-Pad-Buckets") != "256,384,512,768" {
+			t.Fatalf("expected X-Call-Pad-Buckets: 256,384,512,768, got %q", created.Header.Get("X-Call-Pad-Buckets"))
+		}
+		if created.Header.Get("X-Call-Flush-Jitter-Ms") != "8" {
+			t.Fatalf("expected X-Call-Flush-Jitter-Ms: 8, got %q", created.Header.Get("X-Call-Flush-Jitter-Ms"))
 		}
 		return created.Header.Get("X-Session-Token")
 	}

@@ -3,6 +3,7 @@ package frame
 import (
 	"bytes"
 	"errors"
+	"math"
 	"net/netip"
 	"testing"
 )
@@ -90,3 +91,80 @@ func TestOpenTCPTargetCodecAndShape(t *testing.T) {
 		}
 	}
 }
+
+func TestComputePadPayloadsExhaustive(t *testing.T) {
+	if err := ValidateClientShape(Frame{Type: Pad, StreamID: 0, Payload: nil}); err != nil {
+		t.Fatalf("rejected empty Pad frame on stream 0: %v", err)
+	}
+	if err := ValidateClientShape(Frame{Type: Pad, StreamID: 0, Payload: make([]byte, MaxPadPayload)}); err != nil {
+		t.Fatalf("rejected 255-byte Pad frame on stream 0: %v", err)
+	}
+	if err := ValidateClientShape(Frame{Type: Pad, StreamID: 1, Payload: nil}); err == nil {
+		t.Fatal("accepted Pad frame on nonzero stream")
+	}
+	if err := ValidateClientShape(Frame{Type: Pad, StreamID: 0, Payload: make([]byte, MaxPadPayload+1)}); err == nil {
+		t.Fatal("accepted oversized Pad frame on stream 0")
+	}
+
+	buckets := []int{64, 128, 256, 384, 512, 768, 1024}
+	for _, targetBucket := range buckets {
+		for rawLen := 1; rawLen <= 4096; rawLen++ {
+			payloads := ComputePadPayloads(rawLen, targetBucket)
+			if len(payloads) == 0 {
+				t.Fatalf("ComputePadPayloads(%d, %d) returned empty payloads", rawLen, targetBucket)
+			}
+			paddedLen := rawLen
+			for _, p := range payloads {
+				if p < 0 || p > MaxPadPayload {
+					t.Fatalf("ComputePadPayloads(%d, %d) produced out-of-range payload %d", rawLen, targetBucket, p)
+				}
+				paddedLen += HeaderSize + p
+			}
+			if paddedLen < rawLen+HeaderSize {
+				t.Fatalf("ComputePadPayloads(%d, %d) added fewer than %d bytes: paddedLen=%d", rawLen, targetBucket, HeaderSize, paddedLen)
+			}
+			if rawLen < targetBucket {
+				if paddedLen < targetBucket || (paddedLen-targetBucket)%PadBucketStep != 0 {
+					t.Fatalf("ComputePadPayloads(%d, %d) misaligned paddedLen=%d", rawLen, targetBucket, paddedLen)
+				}
+			} else if paddedLen%PadBucketStep != 0 {
+				t.Fatalf("ComputePadPayloads(%d, %d) above-bucket misaligned paddedLen=%d", rawLen, targetBucket, paddedLen)
+			}
+		}
+	}
+}
+
+func TestCallPaddingStatisticalEntropy(t *testing.T) {
+	defaultBuckets := []int{256, 384, 512, 768}
+	sizeCounts := make(map[int]int)
+	const samples = 500
+	for i := 0; i < samples; i++ {
+		rawPayloadLen := 52 + (i % 81) // raw frame length 60..140 bytes (typical 20ms Opus speech)
+		rawBatch := Encode(Data, 7, bytes.Repeat([]byte{0x42}, rawPayloadLen))
+		padded := AppendCallPadding(rawBatch, 2*1024*1024, defaultBuckets)
+		if len(padded) <= len(rawBatch) {
+			t.Fatalf("sample %d was not padded: raw=%d padded=%d", i, len(rawBatch), len(padded))
+		}
+		sizeCounts[len(padded)]++
+		parsed, err := ParseAll(padded, MaxPayload)
+		if err != nil {
+			t.Fatalf("ParseAll failed on padded batch: %v", err)
+		}
+		stripped := StripPadFrames(parsed)
+		if len(stripped) != 1 || stripped[0].Type != Data || stripped[0].StreamID != 7 || len(stripped[0].Payload) != rawPayloadLen {
+			t.Fatalf("StripPadFrames corrupted batch: %#v", stripped)
+		}
+	}
+	if len(sizeCounts) < 2 {
+		t.Fatalf("expected at least 2 distinct padded bucket sizes, got %v", sizeCounts)
+	}
+	entropy := 0.0
+	for _, count := range sizeCounts {
+		p := float64(count) / float64(samples)
+		entropy -= p * math.Log2(p)
+	}
+	if entropy < 0.8 {
+		t.Fatalf("expected padded packet size Shannon entropy >= 0.8 bits, got %.3f bits (counts=%v)", entropy, sizeCounts)
+	}
+}
+

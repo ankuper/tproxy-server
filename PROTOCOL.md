@@ -430,6 +430,7 @@ type:u8 | stream_id:u24 | payload_length:u32 | payload
 | `0x05` | `PING` | relay → client | zero | opaque echo token |
 | `0x06` | `PONG` | client → relay | zero | exact echo token |
 | `0x07` | `OPEN_TCP` | client → relay | nonzero | `addr_len:u8 (4\|16) \| ip \| port:u16` |
+| `0x08` | `PAD` | both | zero | `0..255` opaque padding bytes |
 | `0x10` | `HELLO` | client → relay | zero | byte `01` |
 | `0x11` | `WELCOME` | relay → client | zero | empty |
 | `0x1f` | `BYE` | relay → client | zero | optional bounded reason |
@@ -515,6 +516,16 @@ bearer (`X-Session-Token`). This Dual-Session Native Call Sidecar pattern keeps
 `X-Up-Seq`, `X-Down-Cursor`, and `stream_id` namespaces isolated from the
 foreground WebView so active calls survive proximity-sensor screen-off and app
 backgrounding.
+
+When call padding is enabled (`call_pad_buckets`, default `[256, 384, 512, 768]`,
+and `call_flush_jitter_ms`, default `8`), `POST /api/v1/session` also returns
+`X-Call-Pad-Buckets` and `X-Call-Flush-Jitter-Ms`. Both the bridge and the relay
+pad carrier writes for active call lanes/streams to a randomized bucket boundary
+by appending one or more `PAD` (`0x08`, `stream_id = 0`, payload `0..255` bytes)
+frames and applying a bounded `0..call_flush_jitter_ms` flush delay. If a remainder
+is `1..7` bytes (`< HeaderSize`), the target steps up by `128` bytes so a valid
+8-byte-header `PAD` frame always fits without overflow. Receiving sides strip
+`PAD` frames before lane-ID checks, window accounting, and native client delivery.
 
 ## Implementation references
 

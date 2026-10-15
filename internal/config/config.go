@@ -138,14 +138,17 @@ type profileFile struct {
 }
 
 type profileInput struct {
-	Name          string        `json:"name"`
-	Secret        string        `json:"secret"`
-	Backend       string        `json:"backend"`
-	CarrierMode   CarrierMode   `json:"carrier_mode"`
-	CallsTCP      bool          `json:"calls_tcp"`
-	CallAllowlist []string      `json:"call_allowlist"`
-	CallPorts     []uint16      `json:"call_ports"`
-	Limits        ProfileLimits `json:"limits"`
+	Name              string        `json:"name"`
+	Secret            string        `json:"secret"`
+	Backend           string        `json:"backend"`
+	CarrierMode       CarrierMode   `json:"carrier_mode"`
+	CallsTCP          bool          `json:"calls_tcp"`
+	CallAllowlist     []string      `json:"call_allowlist"`
+	CallPorts         []uint16      `json:"call_ports"`
+	CallPadBuckets    []int         `json:"call_pad_buckets"`
+	CallPadQuantum    int           `json:"call_pad_quantum"`
+	CallFlushJitterMs *int          `json:"call_flush_jitter_ms"`
+	Limits            ProfileLimits `json:"limits"`
 }
 
 type ProfileLimits struct {
@@ -161,14 +164,16 @@ type ProfileLimits struct {
 }
 
 type Profile struct {
-	Name          string
-	Backend       string
-	CarrierMode   CarrierMode
-	CallsTCP      bool
-	CallAllowlist []netip.Prefix
-	CallPorts     []uint16
-	Capability    [sha256.Size]byte
-	Limits        ProfileLimits
+	Name              string
+	Backend           string
+	CarrierMode       CarrierMode
+	CallsTCP          bool
+	CallAllowlist     []netip.Prefix
+	CallPorts         []uint16
+	CallPadBuckets    []int
+	CallFlushJitterMs int
+	Capability        [sha256.Size]byte
+	Limits            ProfileLimits
 }
 
 func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
@@ -586,6 +591,14 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 		if err != nil {
 			return nil, fmt.Errorf("profile %q call_ports: %w", input.Name, err)
 		}
+		callPadBuckets, err := resolveCallPadBuckets(input.CallsTCP, input.CallPadBuckets, input.CallPadQuantum)
+		if err != nil {
+			return nil, fmt.Errorf("profile %q call_pad_buckets: %w", input.Name, err)
+		}
+		callFlushJitterMs, err := resolveCallFlushJitterMs(input.CallsTCP, input.CallFlushJitterMs)
+		if err != nil {
+			return nil, fmt.Errorf("profile %q call_flush_jitter_ms: %w", input.Name, err)
+		}
 		if err := validateProfileLimits(input.Limits, limits); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
 		}
@@ -602,14 +615,16 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 			return nil, fmt.Errorf("duplicate capability for profile %q", input.Name)
 		}
 		result = append(result, Profile{
-			Name:          input.Name,
-			Backend:       input.Backend,
-			CarrierMode:   carrierMode,
-			CallsTCP:      input.CallsTCP,
-			CallAllowlist: callAllowlist,
-			CallPorts:     callPorts,
-			Capability:    capability,
-			Limits:        profileLimits,
+			Name:              input.Name,
+			Backend:           input.Backend,
+			CarrierMode:       carrierMode,
+			CallsTCP:          input.CallsTCP,
+			CallAllowlist:     callAllowlist,
+			CallPorts:         callPorts,
+			CallPadBuckets:    callPadBuckets,
+			CallFlushJitterMs: callFlushJitterMs,
+			Capability:        capability,
+			Limits:            profileLimits,
 		})
 		names[input.Name] = struct{}{}
 		capabilities[capability] = struct{}{}
@@ -773,6 +788,81 @@ func resolveCallPorts(enabled bool, raw []uint16) ([]uint16, error) {
 		result = append(result, port)
 	}
 	return result, nil
+}
+
+const (
+	DefaultCallFlushJitterMs = 8
+	MaxCallFlushJitterMs     = 15
+)
+
+func DefaultCallPadBuckets() []int {
+	return []int{256, 384, 512, 768}
+}
+
+func resolveCallPadBuckets(enabled bool, rawBuckets []int, rawQuantum int) ([]int, error) {
+	if !enabled {
+		if len(rawBuckets) != 0 || rawQuantum != 0 {
+			return nil, errors.New("requires calls_tcp to be enabled")
+		}
+		return nil, nil
+	}
+	if len(rawBuckets) != 0 && rawQuantum != 0 {
+		return nil, errors.New("cannot specify both call_pad_buckets and call_pad_quantum")
+	}
+	if rawQuantum < 0 || (len(rawBuckets) == 1 && rawBuckets[0] == 0) {
+		return nil, nil
+	}
+	if rawQuantum > 0 {
+		if !validCallPadBucketSize(rawQuantum) {
+			return nil, fmt.Errorf("call_pad_quantum %d must be between 64 and 1024 and a multiple of 128 (or 64)", rawQuantum)
+		}
+		if rawQuantum*2 <= 1024 {
+			return []int{rawQuantum, rawQuantum * 2}, nil
+		}
+		return []int{rawQuantum}, nil
+	}
+	if len(rawBuckets) == 0 {
+		return DefaultCallPadBuckets(), nil
+	}
+	if len(rawBuckets) > 8 {
+		return nil, errors.New("call_pad_buckets may contain at most 8 buckets")
+	}
+	result := make([]int, 0, len(rawBuckets))
+	prev := 0
+	for _, bucket := range rawBuckets {
+		if !validCallPadBucketSize(bucket) {
+			return nil, fmt.Errorf("bucket %d must be between 64 and 1024 and a multiple of 128 (or 64)", bucket)
+		}
+		if bucket <= prev {
+			return nil, errors.New("call_pad_buckets must be sorted in strictly ascending order")
+		}
+		prev = bucket
+		result = append(result, bucket)
+	}
+	return result, nil
+}
+
+func validCallPadBucketSize(bucket int) bool {
+	if bucket < 64 || bucket > 1024 {
+		return false
+	}
+	return bucket == 64 || bucket%128 == 0
+}
+
+func resolveCallFlushJitterMs(enabled bool, raw *int) (int, error) {
+	if !enabled {
+		if raw != nil {
+			return 0, errors.New("requires calls_tcp to be enabled")
+		}
+		return 0, nil
+	}
+	if raw == nil {
+		return DefaultCallFlushJitterMs, nil
+	}
+	if *raw < 0 || *raw > MaxCallFlushJitterMs {
+		return 0, fmt.Errorf("must be between 0 and %d", MaxCallFlushJitterMs)
+	}
+	return *raw, nil
 }
 
 func (p Profile) AllowsCallTarget(target netip.AddrPort) bool {

@@ -546,7 +546,11 @@ through a profile using `https-lanes`, `websocket-lanes`, or `https-stream`, set
 `"calls_tcp": true`. When `call_allowlist` and `call_ports` are omitted, the relay
 populates official Telegram ASN IPv4/IPv6 CIDR prefixes and ports `[443, 5222]`,
 while unconditionally blocking loopback, RFC 1918, RFC 4193, link-local, multicast,
-and unspecified addresses before checking the allowlist.
+and unspecified addresses before checking the allowlist. Call profiles also enable
+multi-bucket `PAD` (`0x08`) traffic shaping (`call_pad_buckets`, default
+`[256, 384, 512, 768]`, or single-integer shorthand `call_pad_quantum`) and bounded
+flush micro-pacing (`call_flush_jitter_ms`, default `8`, range `0..15`) so 20 ms
+Opus voice packets do not form a constant-size 50 Hz DPI signature.
 
 Run one official MTProxy process and listener per profile when profiles need
 separate quotas or routing. Extend `firewall.nft` to include every added backend

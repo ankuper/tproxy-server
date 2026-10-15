@@ -1,6 +1,7 @@
 package frame
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ const (
 	DataChunk           = 64 * 1024
 	MaxStreamID         = 0xFFFFFF
 	MaxBatchFrames      = 4096
+	MaxPadPayload       = 255
+	PadBucketStep       = 128
 )
 
 type Type byte
@@ -26,6 +29,7 @@ const (
 	Ping    Type = 0x05
 	Pong    Type = 0x06
 	OpenTCP Type = 0x07
+	Pad     Type = 0x08
 	Hello   Type = 0x10
 	Welcome Type = 0x11
 	Bye     Type = 0x1F
@@ -177,10 +181,20 @@ func DecodeOpenTCPTarget(payload []byte) (netip.AddrPort, error) {
 
 func ValidateClientShape(value Frame) error {
 	if value.StreamID == 0 {
-		if value.Type != Pong || len(value.Payload) > 64 {
+		switch value.Type {
+		case Pong:
+			if len(value.Payload) > 64 {
+				return fmt.Errorf("frame type %#x is invalid on stream zero", value.Type)
+			}
+			return nil
+		case Pad:
+			if len(value.Payload) > MaxPadPayload {
+				return fmt.Errorf("PAD payload length %d exceeds %d", len(value.Payload), MaxPadPayload)
+			}
+			return nil
+		default:
 			return fmt.Errorf("frame type %#x is invalid on stream zero", value.Type)
 		}
-		return nil
 	}
 	switch value.Type {
 	case Open, Close:
@@ -203,4 +217,145 @@ func ValidateClientShape(value Frame) error {
 		return fmt.Errorf("frame type %#x is invalid client-to-relay", value.Type)
 	}
 	return nil
+}
+
+func StripPadFrames(frames []Frame) []Frame {
+	out := frames[:0]
+	for _, value := range frames {
+		if value.Type != Pad {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func SelectCallPadBucket(rawLen int, buckets []int, randomIndex func(n int) int) int {
+	if rawLen <= 0 || len(buckets) == 0 {
+		return 0
+	}
+	if randomIndex == nil {
+		randomIndex = cryptoRandomIndex
+	}
+	minTarget := rawLen + HeaderSize
+	var eligible []int
+	for _, b := range buckets {
+		if b >= minTarget {
+			eligible = append(eligible, b)
+		}
+	}
+	if len(eligible) >= 2 {
+		return eligible[randomIndex(2)]
+	}
+	if len(eligible) == 1 {
+		if len(buckets) > 1 {
+			candidates := [2]int{eligible[0], eligible[0] + PadBucketStep}
+			return candidates[randomIndex(2)]
+		}
+		return eligible[0]
+	}
+	base := ((minTarget + PadBucketStep - 1) / PadBucketStep) * PadBucketStep
+	if len(buckets) > 1 {
+		candidates := [2]int{base, base + PadBucketStep}
+		return candidates[randomIndex(2)]
+	}
+	return base
+}
+
+func ComputePadPayloads(rawLen, targetBucket int) []int {
+	if rawLen <= 0 || targetBucket <= 0 {
+		return nil
+	}
+	need := 0
+	if rawLen < targetBucket {
+		need = targetBucket - rawLen
+	} else if rem := rawLen % PadBucketStep; rem != 0 {
+		need = PadBucketStep - rem
+	} else {
+		need = PadBucketStep
+	}
+	if need < HeaderSize {
+		need += PadBucketStep
+	}
+	var payloads []int
+	for need > 0 {
+		if need <= HeaderSize+MaxPadPayload {
+			payloads = append(payloads, need-HeaderSize)
+			break
+		}
+		chunkTotal := HeaderSize + MaxPadPayload
+		if need-chunkTotal < HeaderSize {
+			chunkTotal = need - HeaderSize
+		}
+		payloads = append(payloads, chunkTotal-HeaderSize)
+		need -= chunkTotal
+	}
+	return payloads
+}
+
+func AppendCallPadding(batch []byte, maxBatchBytes int, buckets []int) []byte {
+	if len(batch) == 0 || len(buckets) == 0 {
+		return batch
+	}
+	frameCount := countBatchFrames(batch)
+	if frameCount <= 0 || frameCount >= MaxBatchFrames {
+		return batch
+	}
+	target := SelectCallPadBucket(len(batch), buckets, cryptoRandomIndex)
+	payloads := ComputePadPayloads(len(batch), target)
+	if len(payloads) == 0 || frameCount+len(payloads) > MaxBatchFrames {
+		return batch
+	}
+	addedBytes := 0
+	for _, p := range payloads {
+		addedBytes += HeaderSize + p
+	}
+	if maxBatchBytes > 0 && len(batch)+addedBytes > maxBatchBytes {
+		minBase := ((len(batch) + HeaderSize + PadBucketStep - 1) / PadBucketStep) * PadBucketStep
+		if minBase < target && minBase <= maxBatchBytes {
+			payloads = ComputePadPayloads(len(batch), minBase)
+			addedBytes = 0
+			for _, p := range payloads {
+				addedBytes += HeaderSize + p
+			}
+		}
+		if len(payloads) == 0 || frameCount+len(payloads) > MaxBatchFrames || len(batch)+addedBytes > maxBatchBytes {
+			return batch
+		}
+	}
+	out := make([]byte, len(batch), len(batch)+addedBytes)
+	copy(out, batch)
+	var zeroPayload [MaxPadPayload]byte
+	for _, p := range payloads {
+		out = append(out, Encode(Pad, 0, zeroPayload[:p])...)
+	}
+	return out
+}
+
+func countBatchFrames(batch []byte) int {
+	count := 0
+	input := batch
+	for len(input) >= HeaderSize {
+		length := uint64(binary.BigEndian.Uint32(input[4:8]))
+		full := uint64(HeaderSize) + length
+		if full > uint64(len(input)) {
+			return -1
+		}
+		count++
+		input = input[int(full):]
+	}
+	if len(input) != 0 {
+		return -1
+	}
+	return count
+}
+
+func cryptoRandomIndex(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	return int(b[0]) % n
 }

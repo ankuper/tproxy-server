@@ -1356,3 +1356,140 @@ func TestOpenTCPRejectedWhenDisabledOrWrongCarrier(t *testing.T) {
 		t.Fatalf("accepted OpenTCP on serialized CarrierHTTPS: %v", err)
 	}
 }
+
+func TestCallLaneUplinkPadStrippingAndDownlinkPadding(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer connection.Close()
+				_, _ = io.Copy(connection, connection)
+			}()
+		}
+	}()
+
+	configuration := testConfig(listener.Addr().String())
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	configuration.Profiles[0].CallsTCP = true
+	configuration.Profiles[0].CallAllowlist = config.DefaultTelegramCallPrefixes()
+	configuration.Profiles[0].CallPorts = config.DefaultTelegramCallPorts()
+	configuration.Profiles[0].CallPadBuckets = config.DefaultCallPadBuckets()
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+
+	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(bootstrap, "198.51.100.9", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := created.Session
+	value.SetCallDialMapperForTest(func(target netip.AddrPort) string {
+		return listener.Addr().String()
+	})
+
+	callLaneID := uint32(55)
+	targetPayload, err := frame.EncodeOpenTCPPayload(netip.MustParseAddrPort("149.154.167.99:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	voicePacket := []byte("opus-20ms-voice-frame-payload-bytes")
+	uplink := append(frame.Encode(frame.OpenTCP, callLaneID, targetPayload), frame.Encode(frame.Data, callLaneID, voicePacket)...)
+	uplink = frame.AppendCallPadding(uplink, configuration.Limits.CarrierBatchBytes, configuration.Profiles[0].CallPadBuckets)
+
+	if ack, err := value.ProcessUpLane(callLaneID, 1, uplink); err != nil || ack != 1 {
+		t.Fatalf("padded OpenTCP uplink failed: ack=%d err=%v", ack, err)
+	}
+	// All-Pad uplink batch on established call lane must succeed as a valid no-op and advance sequence.
+	allPad := frame.Encode(frame.Pad, 0, make([]byte, 32))
+	if ack, err := value.ProcessUpLane(callLaneID, 2, allPad); err != nil || ack != 2 {
+		t.Fatalf("all-Pad batch on established lane failed: ack=%d err=%v", ack, err)
+	}
+
+	var firstDown []byte
+	var firstCursor uint64
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		down, next, laneClosed, pollErr := value.PollLane(context.Background(), callLaneID, 0)
+		if pollErr != nil || laneClosed {
+			t.Fatalf("PollLane failed: closed=%v err=%v", laneClosed, pollErr)
+		}
+		frames, parseErr := frame.ParseAll(down, frame.MaxPayload)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		hasPad := false
+		hasData := false
+		for _, item := range frames {
+			if item.Type == frame.Pad && item.StreamID == 0 {
+				hasPad = true
+			}
+			if item.Type == frame.Data && item.StreamID == callLaneID {
+				hasData = true
+			}
+		}
+		if !hasPad {
+			t.Fatalf("expected call lane downlink batch to contain Pad frames, got %#v", frames)
+		}
+		if len(down)%frame.PadBucketStep != 0 {
+			t.Fatalf("expected call lane downlink batch length %d to align to %d", len(down), frame.PadBucketStep)
+		}
+		if hasData {
+			firstDown = down
+			firstCursor = next
+			break
+		}
+		// If the first batch only had WINDOW, advance and poll for DATA.
+		replay, replayCursor, _, replayErr := value.PollLane(context.Background(), callLaneID, 0)
+		if replayErr != nil || replayCursor != next || !bytes.Equal(replay, down) {
+			t.Fatal("call lane downlink batch did not replay byte-for-byte on cursor 0")
+		}
+		down2, next2, _, pollErr2 := value.PollLane(context.Background(), callLaneID, next)
+		if pollErr2 != nil {
+			t.Fatal(pollErr2)
+		}
+		firstDown = down2
+		firstCursor = next2
+		break
+	}
+	if len(firstDown) == 0 {
+		t.Fatal("did not receive padded downlink DATA on call lane")
+	}
+	// Verify byte-identical replay when repeating previous cursor.
+	prevCursor := firstCursor - 1
+	replayed, replayedCursor, _, err := value.PollLane(context.Background(), callLaneID, prevCursor)
+	if err != nil || replayedCursor != firstCursor || !bytes.Equal(replayed, firstDown) {
+		t.Fatal("padded call lane downlink batch was not replayed byte-for-byte")
+	}
+
+	// Non-call lane (Open = 0x01) in the same session must NOT receive downlink Pad frames.
+	normalLaneID := uint32(56)
+	normalUp := append(frame.Encode(frame.Open, normalLaneID, nil), frame.Encode(frame.Data, normalLaneID, []byte("mtproto-api-bytes"))...)
+	if ack, err := value.ProcessUpLane(normalLaneID, 1, normalUp); err != nil || ack != 1 {
+		t.Fatalf("normal lane ProcessUpLane failed: ack=%d err=%v", ack, err)
+	}
+	normalDown, _, _, err := value.PollLane(context.Background(), normalLaneID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalFrames, err := frame.ParseAll(normalDown, frame.MaxPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range normalFrames {
+		if item.Type == frame.Pad {
+			t.Fatalf("unexpected Pad frame on non-call lane %d", normalLaneID)
+		}
+	}
+}
+

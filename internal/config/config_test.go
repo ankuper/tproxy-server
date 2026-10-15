@@ -370,6 +370,9 @@ func TestCallsTCPDefaultsValidationAndSSRFGuard(t *testing.T) {
 	if !profile.CallsTCP || len(profile.CallAllowlist) != len(DefaultTelegramCallPrefixes()) || len(profile.CallPorts) != 2 {
 		t.Fatalf("unexpected default call profile: %#v", profile)
 	}
+	if len(profile.CallPadBuckets) != 4 || profile.CallPadBuckets[0] != 256 || profile.CallPadBuckets[3] != 768 || profile.CallFlushJitterMs != DefaultCallFlushJitterMs {
+		t.Fatalf("unexpected default call padding config: buckets=%v jitter=%d", profile.CallPadBuckets, profile.CallFlushJitterMs)
+	}
 	for _, allowed := range []string{
 		"149.154.167.99:443",
 		"91.108.16.42:5222",
@@ -403,6 +406,28 @@ func TestCallsTCPDefaultsValidationAndSSRFGuard(t *testing.T) {
 		t.Fatal("expected zoned IPv6 address to be rejected by IsForbiddenCallAddr")
 	}
 
+	// Custom call_pad_quantum shorthand and explicit disable.
+	writeProfiles(`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_quantum":256,"call_flush_jitter_ms":0`)
+	loadedQuantum, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("valid call_pad_quantum failed to load: %v", err)
+	}
+	if len(loadedQuantum.Profiles[0].CallPadBuckets) != 2 ||
+		loadedQuantum.Profiles[0].CallPadBuckets[0] != 256 ||
+		loadedQuantum.Profiles[0].CallPadBuckets[1] != 512 ||
+		loadedQuantum.Profiles[0].CallFlushJitterMs != 0 {
+		t.Fatalf("unexpected call_pad_quantum expansion: %#v", loadedQuantum.Profiles[0])
+	}
+
+	writeProfiles(`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[0]`)
+	loadedDisabled, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("explicitly disabled call_pad_buckets failed to load: %v", err)
+	}
+	if len(loadedDisabled.Profiles[0].CallPadBuckets) != 0 {
+		t.Fatalf("expected disabled CallPadBuckets, got %v", loadedDisabled.Profiles[0].CallPadBuckets)
+	}
+
 	// Reject calls_tcp on non-lane carriers (https and websocket).
 	for _, badCarrier := range []string{`"https"`, `"websocket"`} {
 		writeProfiles(`,"carrier_mode":` + badCarrier + `,"calls_tcp":true`)
@@ -411,7 +436,7 @@ func TestCallsTCPDefaultsValidationAndSSRFGuard(t *testing.T) {
 		}
 	}
 
-	// Reject forbidden, non-canonical, or wildcard CIDRs and port 0.
+	// Reject forbidden, non-canonical, or wildcard CIDRs, port 0, and invalid call padding configs.
 	for _, badExtra := range []string{
 		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["0.0.0.0/0"]`,
 		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["::/0"]`,
@@ -423,6 +448,13 @@ func TestCallsTCPDefaultsValidationAndSSRFGuard(t *testing.T) {
 		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["149.154.167.99/20"]`,
 		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_ports":[0]`,
 		`,"carrier_mode":"https-lanes","calls_tcp":false,"call_ports":[443]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[256,512],"call_pad_quantum":256`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[100,256]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[512,256]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[2048]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_flush_jitter_ms":16`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_flush_jitter_ms":-1`,
+		`,"carrier_mode":"https-lanes","calls_tcp":false,"call_pad_buckets":[256]`,
 	} {
 		writeProfiles(badExtra)
 		if _, err := Load(configPath); err == nil {

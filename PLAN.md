@@ -473,6 +473,7 @@ V1 shared-frame values:
 | `0x05` | `PING` | relay to client | 0 | opaque echo token |
 | `0x06` | `PONG` | client to relay | 0 | exact token |
 | `0x07` | `OPEN_TCP` | client to relay | >0 | `addr_len:u8 (4\|16) \| ip \| port:u16` (when `calls_tcp` enabled) |
+| `0x08` | `PAD` | both | 0 | `0..255` opaque padding bytes |
 | `0x10` | `HELLO` | client to relay | 0 | one byte `01` |
 | `0x11` | `WELCOME` | relay to client | 0 | empty |
 | `0x1f` | `BYE` | relay to client | 0 | optional bounded reason |

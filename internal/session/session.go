@@ -317,6 +317,9 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 				break
 			}
 		}
+		if err == nil {
+			frames = frame.StripPadFrames(frames)
+		}
 	}
 
 	s.mu.Lock()
@@ -325,7 +328,21 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		s.mu.Unlock()
 		return 0, ErrClosed
 	}
-	if err != nil || !s.validateBatchLocked(frames) {
+	if err != nil {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return 0, ErrProtocol
+	}
+	if len(frames) == 0 {
+		s.lastUpSequence = sequence
+		s.lastUpDigest = digest
+		s.mu.Unlock()
+		if s.onUp != nil {
+			s.onUp(len(body))
+		}
+		return sequence, nil
+	}
+	if !s.validateBatchLocked(frames) {
 		s.mu.Unlock()
 		s.protocolFailure()
 		return 0, ErrProtocol
@@ -374,9 +391,18 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	frames, err := frame.ParseAll(body, s.limits.MaxFramePayload)
 	if err == nil {
 		for _, value := range frames {
-			if shapeErr := frame.ValidateClientShape(value); shapeErr != nil || value.StreamID != laneID {
+			if shapeErr := frame.ValidateClientShape(value); shapeErr != nil {
 				err = ErrProtocol
 				break
+			}
+		}
+		if err == nil {
+			frames = frame.StripPadFrames(frames)
+			for _, value := range frames {
+				if value.StreamID != laneID {
+					err = ErrProtocol
+					break
+				}
 			}
 		}
 	}
@@ -393,16 +419,23 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	lane := s.carrierLanes[laneID]
 	createdLane := false
 	if lane == nil {
-		if laneID != 0 && len(frames) != 0 && !isOpenFrame(frames[0].Type) &&
-			s.onlyLateFrames(frames) {
-			// The lane's tombstone has already been evicted (or the client
-			// remembers a close the relay no longer does): well-formed late
-			// DATA, WINDOW or CLOSE frames are ignored and acknowledged, the
-			// same as for a remembered tombstone, instead of killing the
-			// session.
-			s.lastActivity = time.Now()
-			s.mu.Unlock()
-			return sequence, nil
+		if laneID != 0 {
+			if len(frames) == 0 {
+				if _, wasClosed := s.closedStreams[laneID]; wasClosed || sequence > 1 {
+					s.lastActivity = time.Now()
+					s.mu.Unlock()
+					return sequence, nil
+				}
+			} else if !isOpenFrame(frames[0].Type) && s.onlyLateFrames(frames) {
+				// The lane's tombstone has already been evicted (or the client
+				// remembers a close the relay no longer does): well-formed late
+				// DATA, WINDOW or CLOSE frames are ignored and acknowledged, the
+				// same as for a remembered tombstone, instead of killing the
+				// session.
+				s.lastActivity = time.Now()
+				s.mu.Unlock()
+				return sequence, nil
+			}
 		}
 		if laneID == 0 || len(frames) == 0 || !isOpenFrame(frames[0].Type) {
 			s.mu.Unlock()
@@ -430,6 +463,20 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	if lane.upActive {
 		s.mu.Unlock()
 		return 0, ErrConcurrent
+	}
+	if len(frames) == 0 {
+		if laneID != 0 && lane.lastUpSequence == 0 {
+			s.mu.Unlock()
+			s.laneProtocolFailure(laneID)
+			return 0, ErrProtocol
+		}
+		lane.lastUpSequence = sequence
+		lane.lastUpDigest = digest
+		s.mu.Unlock()
+		if s.onUp != nil {
+			s.onUp(len(body))
+		}
+		return sequence, nil
 	}
 	lane.upActive = true
 	if !s.validateBatchLocked(frames) {
@@ -1375,6 +1422,9 @@ func (s *Session) takeDownBatchLocked() downBatch {
 	if len(s.pendingFrames) == 0 {
 		s.pendingFrames = nil
 	}
+	if s.activeCallStreams > 0 && len(s.profile.CallPadBuckets) > 0 && len(result) > 0 {
+		result = frame.AppendCallPadding(result, s.limits.CarrierBatchBytes, s.profile.CallPadBuckets)
+	}
 	return downBatch{body: result, cost: cost, items: count}
 }
 
@@ -1406,6 +1456,9 @@ func (s *Session) takeLaneDownBatchLocked(lane *carrierLane) downBatch {
 	}
 	if len(lane.pendingFrames) == 0 {
 		lane.pendingFrames = nil
+	}
+	if lane.isCall && len(s.profile.CallPadBuckets) > 0 && len(result) > 0 {
+		result = frame.AppendCallPadding(result, s.limits.CarrierBatchBytes, s.profile.CallPadBuckets)
 	}
 	return downBatch{body: result, cost: cost, items: count}
 }
