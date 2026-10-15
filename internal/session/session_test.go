@@ -1493,3 +1493,104 @@ func TestCallLaneUplinkPadStrippingAndDownlinkPadding(t *testing.T) {
 	}
 }
 
+func TestHTTPSStreamSessionSupersedeReplayAndCallPadding(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer connection.Close()
+				_, _ = io.Copy(connection, connection)
+			}()
+		}
+	}()
+
+	configuration := testConfig(listener.Addr().String())
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSStream
+	configuration.Profiles[0].CallsTCP = true
+	configuration.Profiles[0].CallAllowlist = config.DefaultTelegramCallPrefixes()
+	configuration.Profiles[0].CallPorts = config.DefaultTelegramCallPorts()
+	configuration.Profiles[0].CallPadBuckets = config.DefaultCallPadBuckets()
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+
+	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(bootstrap, "198.51.100.9", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := created.Session
+	value.SetCallDialMapperForTest(func(target netip.AddrPort) string {
+		return listener.Addr().String()
+	})
+
+	firstStream, err := value.AcquireStreamCarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStream, err := value.AcquireStreamCarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstStream:
+	default:
+		t.Fatal("second stream carrier did not supersede first stream carrier")
+	}
+
+	targetPayload, err := frame.EncodeOpenTCPPayload(netip.MustParseAddrPort("149.154.167.99:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uplink := append(frame.Encode(frame.OpenTCP, 9, targetPayload), frame.Encode(frame.Data, 9, []byte("stream-call-audio"))...)
+	if ack, err := value.ProcessUp(1, uplink); err != nil || ack != 1 {
+		t.Fatalf("ProcessUp on https-stream failed: ack=%d err=%v", ack, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	batch1, cursor1, err := value.NextStreamDownBatch(ctx, secondStream)
+	if err != nil || cursor1 != 1 || len(batch1)%frame.PadBucketStep != 0 {
+		t.Fatalf("NextStreamDownBatch failed or unpadded: cursor=%d len=%d err=%v", cursor1, len(batch1), err)
+	}
+
+	uplink2 := frame.Encode(frame.Data, 9, []byte("-second-chunk"))
+	if ack, err := value.ProcessUp(2, uplink2); err != nil || ack != 2 {
+		t.Fatalf("second ProcessUp on https-stream failed: ack=%d err=%v", ack, err)
+	}
+	// Pipelined uplink replay of both sequence 1 and sequence 2 must succeed idempotently.
+	if ack, err := value.ProcessUp(1, uplink); err != nil || ack != 2 {
+		t.Fatalf("idempotent replay of sequence 1 failed: ack=%d err=%v", ack, err)
+	}
+	if ack, err := value.ProcessUp(2, uplink2); err != nil || ack != 2 {
+		t.Fatalf("idempotent replay of sequence 2 failed: ack=%d err=%v", ack, err)
+	}
+
+	// Simulate reconnect before acknowledging cursor1: thirdStream must replay batch1 byte-for-byte.
+	thirdStream, err := value.AcquireStreamCarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer value.ReleaseStreamCarrier(thirdStream)
+	replayed, replayCursor, err := value.NextStreamDownBatch(ctx, thirdStream)
+	if err != nil || replayCursor != cursor1 || !bytes.Equal(replayed, batch1) {
+		t.Fatal("https-stream reconnect did not replay unacknowledged downlink batch byte-for-byte")
+	}
+	if err := value.AckDownCursor(cursor1); err != nil {
+		t.Fatalf("AckDownCursor failed: %v", err)
+	}
+	if err := value.AckDownCursor(0); err != ErrProtocol {
+		t.Fatalf("regressed AckDownCursor(0) error = %v, want ErrProtocol", err)
+	}
+}
+

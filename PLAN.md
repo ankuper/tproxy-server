@@ -329,8 +329,8 @@ Bridge behavior:
 2. `POST /api/v1/session` with the bootstrap token and first buffer.
 3. Forward the returned `WELCOME` body to the client boundary.
 4. Run the profile-selected carrier: one serialized HTTPS pair, one independent
-   HTTPS pair per logical stream, one multiplexed WebSocket, or one WebSocket per
-   logical stream.
+   HTTPS pair per logical stream, one full-duplex HTTPS stream (`/api/v1/stream`),
+   one multiplexed WebSocket, or one WebSocket per logical stream.
 5. Retry ambiguous HTTP failures with the same sequence/cursor and byte-identical
    body, using bounded exponential backoff with jitter.
 6. Report `reconnecting` during transient carrier loss.
@@ -343,7 +343,7 @@ The reference modes and their exact authentication, sequencing, replay, and clos
 semantics are specified normatively in `PROTOCOL.md`. When deployed across
 stateful middleboxes that fingerprint and throttle RFC 6455 `101 Switching
 Protocols` upgrades after a few megabytes (such as TSPU), profiles should prefer
-`https-lanes` or `https` over `websocket` and `websocket-lanes`. The remainder
+`https-lanes`, `https-stream`, or `https` over `websocket` and `websocket-lanes`. The remainder
 of this section describes the original serialized HTTPS baseline.
 
 ## 6. Baseline HTTP carrier protocol

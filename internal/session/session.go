@@ -103,6 +103,13 @@ func newCarrierLane() *carrierLane {
 	}
 }
 
+type streamDownBatch struct {
+	cursor uint64
+	body   []byte
+	cost   int
+	items  int
+}
+
 type Session struct {
 	profile  *config.Profile
 	clientIP string
@@ -126,6 +133,10 @@ type Session struct {
 	unackedCost           int
 	unackedItems          int
 	unackedBase           uint64
+	streamUnacked         []streamDownBatch
+	streamReplayIndex     int
+	streamAckedCursor     uint64
+	streamUpDigests       map[uint64][sha256.Size]byte
 	downCursor            uint64
 	lastUpSequence        uint64
 	lastUpDigest          [sha256.Size]byte
@@ -162,6 +173,7 @@ func newSession(options sessionOptions) *Session {
 		streams:               make(map[uint32]*streamState),
 		closedStreams:         make(map[uint32]struct{}),
 		pendingWindows:        make(map[uint32]int),
+		streamUpDigests:       make(map[uint64][sha256.Size]byte),
 		lastActivity:          time.Now(),
 		notify:                make(chan struct{}, 1),
 		budgetNotify:          make(chan struct{}),
@@ -288,6 +300,17 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		return 0, ErrClosed
 	}
 	s.lastActivity = time.Now()
+	if s.carrier == config.CarrierHTTPSStream && sequence != 0 && sequence < s.lastUpSequence {
+		prevDigest, hasDigest := s.streamUpDigests[sequence]
+		match := !hasDigest || bytes.Equal(digest[:], prevDigest[:])
+		ack := s.lastUpSequence
+		s.mu.Unlock()
+		if !match {
+			s.protocolFailure()
+			return 0, ErrProtocol
+		}
+		return ack, nil
+	}
 	if sequence == s.lastUpSequence && sequence != 0 {
 		match := bytes.Equal(digest[:], s.lastUpDigest[:])
 		s.mu.Unlock()
@@ -336,6 +359,12 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	if len(frames) == 0 {
 		s.lastUpSequence = sequence
 		s.lastUpDigest = digest
+		if s.carrier == config.CarrierHTTPSStream {
+			s.streamUpDigests[sequence] = digest
+			if sequence > 128 {
+				delete(s.streamUpDigests, sequence-128)
+			}
+		}
 		s.mu.Unlock()
 		if s.onUp != nil {
 			s.onUp(len(body))
@@ -364,6 +393,12 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	if applied {
 		s.lastUpSequence = sequence
 		s.lastUpDigest = digest
+		if s.carrier == config.CarrierHTTPSStream {
+			s.streamUpDigests[sequence] = digest
+			if sequence > 128 {
+				delete(s.streamUpDigests, sequence-128)
+			}
+		}
 	}
 	s.mu.Unlock()
 
@@ -635,6 +670,135 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 			s.mu.Lock()
 			if s.superseded != mine {
 				// This wake-up belonged to the poll that took over.
+				signal(s.notify)
+			}
+		}
+	}
+}
+
+func (s *Session) AcquireStreamCarrier() (<-chan struct{}, error) {
+	if s.carrier != config.CarrierHTTPSStream {
+		return nil, ErrProtocol
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	if s.downActive && s.superseded != nil {
+		close(s.superseded)
+	}
+	mine := make(chan struct{})
+	s.superseded = mine
+	s.downActive = true
+	s.streamReplayIndex = 0
+	s.lastActivity = time.Now()
+	signal(s.notify)
+	return mine, nil
+}
+
+func (s *Session) ReleaseStreamCarrier(mine <-chan struct{}) {
+	s.mu.Lock()
+	if s.superseded == mine {
+		s.downActive = false
+		s.superseded = nil
+		s.streamReplayIndex = len(s.streamUnacked)
+	}
+	s.lastActivity = time.Now()
+	s.mu.Unlock()
+}
+
+func (s *Session) AckDownCursor(ackCursor uint64) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	s.lastActivity = time.Now()
+	if ackCursor > s.downCursor || ackCursor < s.streamAckedCursor {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return ErrProtocol
+	}
+	drop := 0
+	releasedCost := 0
+	releasedItems := 0
+	for drop < len(s.streamUnacked) && s.streamUnacked[drop].cursor <= ackCursor {
+		releasedCost += s.streamUnacked[drop].cost
+		releasedItems += s.streamUnacked[drop].items
+		drop++
+	}
+	if drop > 0 {
+		s.releasePendingLocked(releasedCost, releasedItems)
+		s.streamUnacked = append([]streamDownBatch(nil), s.streamUnacked[drop:]...)
+		if s.streamReplayIndex >= drop {
+			s.streamReplayIndex -= drop
+		} else {
+			s.streamReplayIndex = 0
+		}
+		signal(s.notify)
+	}
+	s.streamAckedCursor = ackCursor
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Session) NextStreamDownBatch(
+	ctx context.Context,
+	mine <-chan struct{},
+) ([]byte, uint64, error) {
+	if s.carrier != config.CarrierHTTPSStream {
+		return nil, 0, ErrProtocol
+	}
+	s.mu.Lock()
+	for {
+		if s.closed {
+			s.mu.Unlock()
+			return nil, 0, ErrClosed
+		}
+		if s.superseded != mine {
+			s.mu.Unlock()
+			return nil, 0, nil
+		}
+		if s.streamReplayIndex < len(s.streamUnacked) {
+			entry := s.streamUnacked[s.streamReplayIndex]
+			s.streamReplayIndex++
+			s.lastActivity = time.Now()
+			s.mu.Unlock()
+			return entry.body, entry.cursor, nil
+		}
+		if len(s.pendingFrames) != 0 {
+			batch := s.takeDownBatchLocked()
+			s.downCursor++
+			next := s.downCursor
+			s.streamUnacked = append(s.streamUnacked, streamDownBatch{
+				cursor: next,
+				body:   batch.body,
+				cost:   batch.cost,
+				items:  batch.items,
+			})
+			s.streamReplayIndex = len(s.streamUnacked)
+			s.lastActivity = time.Now()
+			s.mu.Unlock()
+			if s.onDown != nil {
+				s.onDown(len(batch.body))
+			}
+			return batch.body, next, nil
+		}
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		case <-s.done:
+			return nil, 0, ErrClosed
+		case <-mine:
+			s.mu.Lock()
+			signal(s.notify)
+			s.mu.Unlock()
+			return nil, 0, nil
+		case <-s.notify:
+			s.mu.Lock()
+			if s.superseded != mine {
 				signal(s.notify)
 			}
 		}
@@ -1578,6 +1742,9 @@ func (s *Session) closeLocked() {
 	s.unacked = nil
 	s.unackedCost = 0
 	s.unackedItems = 0
+	s.streamUnacked = nil
+	s.streamReplayIndex = 0
+	s.streamUpDigests = nil
 	signal(s.notify)
 	s.finishOnce.Do(func() {
 		if s.onFinished != nil {

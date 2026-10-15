@@ -5,18 +5,21 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 )
 
 const (
-	HeaderSize          = 8
-	MaxPayload          = 1024 * 1024
-	InitialStreamWindow = 4 * 1024 * 1024
-	DataChunk           = 64 * 1024
-	MaxStreamID         = 0xFFFFFF
-	MaxBatchFrames      = 4096
-	MaxPadPayload       = 255
-	PadBucketStep       = 128
+	HeaderSize           = 8
+	MaxPayload           = 1024 * 1024
+	InitialStreamWindow  = 4 * 1024 * 1024
+	DataChunk            = 64 * 1024
+	MaxStreamID          = 0xFFFFFF
+	MaxBatchFrames       = 4096
+	MaxPadPayload        = 255
+	PadBucketStep        = 128
+	StreamUpHeaderSize   = 20
+	StreamDownHeaderSize = 12
 )
 
 type Type byte
@@ -358,4 +361,82 @@ func cryptoRandomIndex(n int) int {
 		return 0
 	}
 	return int(b[0]) % n
+}
+
+func EncodeStreamUpEnvelope(sequence, ackCursor uint64, body []byte) []byte {
+	result := make([]byte, StreamUpHeaderSize+len(body))
+	binary.BigEndian.PutUint64(result[0:8], sequence)
+	binary.BigEndian.PutUint64(result[8:16], ackCursor)
+	binary.BigEndian.PutUint32(result[16:20], uint32(len(body)))
+	copy(result[20:], body)
+	return result
+}
+
+func ReadStreamUpEnvelope(
+	r io.Reader,
+	maxBytes int,
+	beforeHeader func(),
+	beforeBody func(),
+) (uint64, uint64, []byte, error) {
+	if beforeHeader != nil {
+		beforeHeader()
+	}
+	var header [StreamUpHeaderSize]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, 0, nil, err
+	}
+	sequence := binary.BigEndian.Uint64(header[0:8])
+	ackCursor := binary.BigEndian.Uint64(header[8:16])
+	length := binary.BigEndian.Uint32(header[16:20])
+	if maxBytes <= 0 || uint64(length) > uint64(maxBytes) {
+		return 0, 0, nil, ErrPayload
+	}
+	if sequence == 0 {
+		if length != 0 {
+			return 0, 0, nil, ErrPayload
+		}
+		return 0, ackCursor, nil, nil
+	}
+	if length == 0 {
+		return 0, 0, nil, ErrPayload
+	}
+	if beforeBody != nil {
+		beforeBody()
+	}
+	body := make([]byte, int(length))
+	if _, err := io.ReadFull(r, body); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, 0, nil, io.ErrUnexpectedEOF
+		}
+		return 0, 0, nil, err
+	}
+	return sequence, ackCursor, body, nil
+}
+
+func EncodeStreamDownEnvelope(cursor uint64, body []byte) []byte {
+	result := make([]byte, StreamDownHeaderSize+len(body))
+	binary.BigEndian.PutUint64(result[0:8], cursor)
+	binary.BigEndian.PutUint32(result[8:12], uint32(len(body)))
+	copy(result[12:], body)
+	return result
+}
+
+func ReadStreamDownEnvelope(r io.Reader, maxBytes int) (uint64, []byte, error) {
+	var header [StreamDownHeaderSize]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, nil, err
+	}
+	cursor := binary.BigEndian.Uint64(header[0:8])
+	length := binary.BigEndian.Uint32(header[8:12])
+	if length == 0 || maxBytes <= 0 || uint64(length) > uint64(maxBytes) {
+		return 0, nil, ErrPayload
+	}
+	body := make([]byte, int(length))
+	if _, err := io.ReadFull(r, body); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, nil, io.ErrUnexpectedEOF
+		}
+		return 0, nil, err
+	}
+	return cursor, body, nil
 }

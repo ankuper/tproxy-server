@@ -38,6 +38,7 @@ type CarrierMode string
 const (
 	CarrierHTTPS          CarrierMode = "https"
 	CarrierHTTPSLanes     CarrierMode = "https-lanes"
+	CarrierHTTPSStream    CarrierMode = "https-stream"
 	CarrierWebSocket      CarrierMode = "websocket"
 	CarrierWebSocketLanes CarrierMode = "websocket-lanes"
 )
@@ -45,12 +46,14 @@ const (
 func (m CarrierMode) Valid() bool {
 	return m == CarrierHTTPS ||
 		m == CarrierHTTPSLanes ||
+		m == CarrierHTTPSStream ||
 		m == CarrierWebSocket ||
 		m == CarrierWebSocketLanes
 }
 
 func (m CarrierMode) SupportsCallsTCP() bool {
 	return m == CarrierHTTPSLanes ||
+		m == CarrierHTTPSStream ||
 		m == CarrierWebSocketLanes
 }
 

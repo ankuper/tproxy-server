@@ -168,3 +168,44 @@ func TestCallPaddingStatisticalEntropy(t *testing.T) {
 	}
 }
 
+func TestStreamEnvelopeCodec(t *testing.T) {
+	batch := Encode(Data, 1, []byte("hello-stream"))
+	upEncoded := EncodeStreamUpEnvelope(3, 2, batch)
+	seq, ack, body, err := ReadStreamUpEnvelope(bytes.NewReader(upEncoded), 1024, nil, nil)
+	if err != nil || seq != 3 || ack != 2 || !bytes.Equal(body, batch) {
+		t.Fatalf("ReadStreamUpEnvelope failed: seq=%d ack=%d err=%v", seq, ack, err)
+	}
+
+	ackOnly := EncodeStreamUpEnvelope(0, 5, nil)
+	seq, ack, body, err = ReadStreamUpEnvelope(bytes.NewReader(ackOnly), 1024, nil, nil)
+	if err != nil || seq != 0 || ack != 5 || len(body) != 0 {
+		t.Fatalf("ReadStreamUpEnvelope ack-only failed: seq=%d ack=%d len=%d err=%v", seq, ack, len(body), err)
+	}
+
+	if _, _, _, err := ReadStreamUpEnvelope(bytes.NewReader(EncodeStreamUpEnvelope(0, 5, batch)), 1024, nil, nil); err == nil {
+		t.Fatal("accepted nonzero body on sequence=0 ack-only envelope")
+	}
+	if _, _, _, err := ReadStreamUpEnvelope(bytes.NewReader(EncodeStreamUpEnvelope(1, 0, nil)), 1024, nil, nil); err == nil {
+		t.Fatal("accepted empty body on sequence>0 envelope")
+	}
+	if _, _, _, err := ReadStreamUpEnvelope(bytes.NewReader(upEncoded), 4, nil, nil); !errors.Is(err, ErrPayload) {
+		t.Fatalf("expected ErrPayload on oversized uplink envelope, got %v", err)
+	}
+	if _, _, _, err := ReadStreamUpEnvelope(bytes.NewReader(upEncoded[:22]), 1024, nil, nil); err == nil {
+		t.Fatal("accepted truncated uplink envelope body")
+	}
+
+	downEncoded := EncodeStreamDownEnvelope(9, batch)
+	cursor, downBody, err := ReadStreamDownEnvelope(bytes.NewReader(downEncoded), 1024)
+	if err != nil || cursor != 9 || !bytes.Equal(downBody, batch) {
+		t.Fatalf("ReadStreamDownEnvelope failed: cursor=%d err=%v", cursor, err)
+	}
+	if _, _, err := ReadStreamDownEnvelope(bytes.NewReader(EncodeStreamDownEnvelope(9, nil)), 1024); err == nil {
+		t.Fatal("accepted empty downlink envelope")
+	}
+	if _, _, err := ReadStreamDownEnvelope(bytes.NewReader(downEncoded), 4); !errors.Is(err, ErrPayload) {
+		t.Fatalf("expected ErrPayload on oversized downlink envelope, got %v", err)
+	}
+}
+
+

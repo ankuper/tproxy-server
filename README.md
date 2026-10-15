@@ -426,6 +426,7 @@ systemd units, and let the relay serve the whole hostname:
 encode zstd gzip
 header -Via
 reverse_proxy 127.0.0.1:8080 {
+  flush_interval -1
   transport http {
     response_header_timeout 40s
   }
@@ -514,6 +515,7 @@ client secret, and numeric loopback backend:
 |---|---|---|
 | `https` | one serialized POST plus one long poll | conservative baseline; avoids HTTP `101` WebSocket upgrades; one direction is capped near `carrier_batch_bytes / RTT` |
 | `https-lanes` | independent POST sequence and long poll for every logical stream | mirrors Telegram TCP sessions, isolates latency over HTTP/2, and avoids HTTP `101` WebSocket upgrades; recommended on TSPU/DPI-filtered networks |
+| `https-stream` | one full-duplex streaming `POST /api/v1/stream` carrying length-delimited envelopes | eliminates per-batch HTTP stop-and-wait RTT without an HTTP `101` WebSocket upgrade; suited for native HTTP/2 call sidecars and Chromium-based WebViews (`duplex: 'half'`, not supported on iOS `WKWebView`) |
 | `websocket` | one ordered WebSocket multiplexing all streams | removes HTTP stop-and-wait with one connection; all streams share its TCP congestion domain; vulnerable to stateful DPI/TSPU throttling of HTTP `101` upgrades |
 | `websocket-lanes` | one ordered WebSocket for every logical stream | isolates browser and relay queues so bulk media does not block interactive streams; increases connection/handshake count and exposes HTTP `101` upgrades per stream |
 

@@ -419,13 +419,13 @@ func TestCallsTCPDefaultsValidationAndSSRFGuard(t *testing.T) {
 		t.Fatalf("unexpected call_pad_quantum expansion: %#v", loadedQuantum.Profiles[0])
 	}
 
-	writeProfiles(`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[0]`)
+	writeProfiles(`,"carrier_mode":"https-stream","calls_tcp":true,"call_pad_buckets":[0]`)
 	loadedDisabled, err := Load(configPath)
 	if err != nil {
-		t.Fatalf("explicitly disabled call_pad_buckets failed to load: %v", err)
+		t.Fatalf("explicitly disabled call_pad_buckets on https-stream failed to load: %v", err)
 	}
-	if len(loadedDisabled.Profiles[0].CallPadBuckets) != 0 {
-		t.Fatalf("expected disabled CallPadBuckets, got %v", loadedDisabled.Profiles[0].CallPadBuckets)
+	if loadedDisabled.Profiles[0].CarrierMode != CarrierHTTPSStream || len(loadedDisabled.Profiles[0].CallPadBuckets) != 0 {
+		t.Fatalf("expected https-stream with disabled CallPadBuckets, got %#v", loadedDisabled.Profiles[0])
 	}
 
 	// Reject calls_tcp on non-lane carriers (https and websocket).

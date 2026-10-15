@@ -88,10 +88,10 @@ const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(
 history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
 let queuedBytes=0,queuedItems=0,pollController=null,webSocket=null,webSocketTimer=0;
-const pending=[],upPending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
+const pending=[],upPending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[],activeCallStreams=new Set(),streamReplay=[];
 const queueLimit=33554432,queueItemLimit=16384,closedLaneLimit=4096;
 const laneQueueLimit=8388608,laneItemLimit=1024,batchLimit=__BATCH_LIMIT__;
-let upSequence=1,downCursor='0',upRunning=false,callPadBuckets=[],callFlushJitterMs=0;
+let upSequence=1,downCursor='0',upRunning=false,callPadBuckets=[],callFlushJitterMs=0,streamWriter=null,streamAckPending=false,streamConnectedOnce=false;
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 const options=(method,token,body,headers,signal,keepalive)=>({
@@ -169,6 +169,12 @@ function padCallBatch(body,frameCount){
  out.set(new Uint8Array(body),0);let offset=rawLen;
  for(const p of payloads){out[offset]=8;view.setUint32(offset+4,p);offset+=8+p}
  return out.buffer;
+}
+function encodeStreamUp(seq,ack,body){
+ const len=body?body.byteLength:0,out=new Uint8Array(20+len),view=new DataView(out.buffer);
+ view.setBigUint64(0,BigInt(seq));view.setBigUint64(8,BigInt(ack));view.setUint32(16,len);
+ if(len)out.set(new Uint8Array(body),20);
+ return out;
 }
 function frameBound(value,maxFrames,maxBytes){
  const view=new DataView(value);let offset=0,frames=0;
@@ -263,15 +269,117 @@ async function createSession(first){
   for(const data of pending.splice(0)){release(data.byteLength,1,null);queueCarrier(data)}
   if(carrierMode==='https')poll();
   else if(carrierMode==='https-lanes')pollLane(ensureLane(0));
+  else if(carrierMode==='https-stream')runStream();
  }catch(error){fail()}
 }
 function queueCarrier(data){
  try{
   if(carrierMode==='https')queueUp(data);
   else if(carrierMode==='https-lanes')for(const value of splitFrames(data))queueLane(value);
+  else if(carrierMode==='https-stream')queueStream(data);
   else if(carrierMode==='websocket')queueWebSocket(data);
   else for(const value of splitFrames(data))queueWebSocketLane(value);
  }catch(error){fail()}
+}
+function queueStream(data){
+ for(const value of splitFrames(data)){
+  if(value.type===7)activeCallStreams.add(value.id);
+ }
+ if(!reserve(data,null)){fail();return}
+ upPending.push(data);flushStreamUp();
+}
+async function flushStreamUp(){
+ if(upRunning||!streamWriter||closed||!sessionToken)return;
+ upRunning=true;
+ try{
+  while(!closed&&sessionToken&&streamWriter&&(upPending.length||streamAckPending)){
+   if(upPending.length){
+    if(activeCallStreams.size&&callFlushJitterMs>0){
+     await pause(Math.floor(Math.random()*(callFlushJitterMs+1)));
+     if(closed||!sessionToken||!streamWriter||!upPending.length)break;
+    }
+    const batch=joinPending(upPending,null),seq=upSequence;
+    const wireBody=activeCallStreams.size&&callPadBuckets.length?padCallBatch(batch.body,batch.frames):batch.body;
+    for(const value of splitFrames(batch.body))if(value.type===3)activeCallStreams.delete(value.id);
+    if(streamReplay.length>=64)streamReplay.shift();
+    streamReplay.push({seq,body:wireBody});
+    streamAckPending=false;
+    streamWriter.enqueue(encodeStreamUp(seq,downCursor,wireBody));
+    release(batch.total,batch.count,null);port.postMessage({t:'traffic',up:wireBody.byteLength,down:0});upSequence++;
+   }else if(streamAckPending){
+    streamAckPending=false;
+    streamWriter.enqueue(encodeStreamUp(0,downCursor,null));
+   }
+  }
+ }catch(error){fail()}
+ finally{upRunning=false;if(!closed&&sessionToken&&streamWriter&&(upPending.length||streamAckPending))flushStreamUp()}
+}
+async function runStream(){
+ let delay=250,attempt=0;
+ while(!closed&&sessionToken){
+  pollController=new AbortController();
+  let reader=null;
+  try{
+   const reconnecting=streamConnectedOnce;
+   streamConnectedOnce=true;
+   const bodyStream=new ReadableStream({
+    start(c){
+     streamWriter=c;
+     if(reconnecting&&streamReplay.length){
+      for(const item of streamReplay)c.enqueue(encodeStreamUp(item.seq,downCursor,item.body));
+      streamAckPending=false;
+     }else if(BigInt(downCursor)>0n){
+      streamAckPending=true;
+     }
+     flushStreamUp();
+    },
+    cancel(){streamWriter=null}
+   });
+   const response=await fetch(relayBase+'api/v1/stream',Object.assign(options('POST',sessionToken,bodyStream,null,pollController.signal),{duplex:'half'}));
+   if(response.status!==200||!response.body)throw new Error('stream rejected');
+   status('connected');
+   reader=response.body.getReader();
+   let acc=new Uint8Array(0);
+   while(!closed){
+    const step=await reader.read();
+    if(step.done){
+     if(acc.byteLength)throw new Error('truncated stream envelope');
+     if(!closed)throw new Error('stream closed');
+     break;
+    }
+    if(step.value&&step.value.byteLength){
+     const next=new Uint8Array(acc.byteLength+step.value.byteLength);
+     next.set(acc,0);next.set(step.value,acc.byteLength);acc=next;
+    }
+    while(acc.byteLength>=12){
+     const view=new DataView(acc.buffer,acc.byteOffset,acc.byteLength);
+     const cursorBig=view.getBigUint64(0),cursor=String(cursorBig),len=view.getUint32(8);
+     if(!len||len>batchLimit)throw new Error('invalid stream envelope');
+     if(acc.byteLength<12+len)break;
+     const raw=acc.slice(12,12+len).buffer;acc=acc.slice(12+len);
+     const stripped=stripPadFrames(raw);
+     if(cursorBig<=BigInt(downCursor)){
+      streamAckPending=true;flushStreamUp();
+      continue;
+     }
+     for(const item of stripped.frames)if(item.type===3)activeCallStreams.delete(item.id);
+     downCursor=cursor;streamAckPending=true;flushStreamUp();
+     port.postMessage({t:'traffic',up:0,down:raw.byteLength});
+     if(stripped.body.byteLength)port.postMessage(stripped.body,[stripped.body]);
+     attempt=0;delay=250;status('connected');
+    }
+   }
+  }catch(error){
+   if(closed)return;
+   attempt++;if(attempt>=9){fail();return}
+   status('reconnecting');
+   await pause(delay+Math.floor(Math.random()*Math.max(1,delay/4)));
+   delay=Math.min(delay*2,5000);
+  }finally{
+   streamWriter=null;
+   if(reader)try{await reader.cancel()}catch(error){}
+  }
+ }
 }
 function queueUp(data){
  if(!reserve(data,null)){fail();return}
@@ -463,6 +571,8 @@ function runWebSocketLaneUp(lane){
 function close(notifyServer){
  if(closed)return;
  closed=true;
+ if(streamWriter)try{streamWriter.close()}catch(error){}
+ streamWriter=null;
  if(pollController)pollController.abort();
  for(const lane of lanes.values()){
   if(lane.controller)lane.controller.abort();
